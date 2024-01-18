@@ -13,6 +13,7 @@ from .transforms import (ImageTransform, BboxTransform, MaskTransform,
                          SegMapTransform, Numpy2Tensor)
 from .utils import to_tensor, random_scale
 from .extra_aug import ExtraAugmentation
+from .backend import ZipBackend
 
 INF = 1e8
 
@@ -59,10 +60,19 @@ class ECPCocoDataset(CustomDataset):
                  regress_ranges=None,
                  upper_factor=None,
                  upper_more_factor=None,
+                 mixup=True,
+                 mixup_ratio=(0.4, 0.6),
+                 mixup_prob=0.5,
+                 zip_backend=False,
                  with_width=False):
         # prefix of images path
         self.small_box_to_ignore = small_box_to_ignore
         self.img_prefix = img_prefix
+        self.mixup_prob = mixup_prob
+        self.mixup = mixup
+        self.mixup_ratio = mixup_ratio
+        if self.mixup and flip_ratio > 0:
+            print(":::::: Mixing it up at (", self.mixup_ratio[0], "-", self.mixup_ratio[1], ")")
         # load annotations (and proposals)
         self.img_infos = self.load_annotations(ann_file)
         if proposal_file is not None:
@@ -146,6 +156,9 @@ class ECPCocoDataset(CustomDataset):
 
         #predict width
         self.with_width = with_width
+        self.backend = None
+        if zip_backend:
+            self.backend = ZipBackend()
 
     def load_annotations(self, ann_file):
         self.coco = COCO(ann_file)
@@ -272,15 +285,37 @@ class ECPCocoDataset(CustomDataset):
             else:
                 scores = None
 
+        gt_bboxes_ignore = np.zeros((0, 4))
+
         ann = self.get_ann_info(idx)
         gt_bboxes = ann['bboxes']
         gt_labels = ann['labels']
         if self.with_crowd:
             gt_bboxes_ignore = ann['bboxes_ignore']
 
+        if self.mixup and self.mixup_prob > np.random.rand():
+            target_idx = np.random.choice(len(self.img_infos))
+            target = self.img_infos[target_idx]
+            mix_s = img
+            if target_idx != idx:
+                mix_t = mmcv.imread(osp.join(self.img_prefix, target['filename']))
+                ratio = np.random.uniform(*self.mixup_ratio)
+                img = np.uint8(mix_s * (1 - ratio) + mix_t * ratio)
+                ann_t = self.get_ann_info(target_idx)
+                gt_bboxes = np.concatenate((gt_bboxes, ann_t["bboxes"]))
+                gt_labels = np.concatenate((gt_labels, ann_t["labels"]))
+
+                if self.with_crowd:
+                    gt_bboxes_ignore = np.concatenate((gt_bboxes_ignore, ann_t["bboxes_ignore"]))
+
         assert len(self.img_scales[0]) == 2 and isinstance(self.img_scales[0][0], int)
 
-        img, gt_bboxes, gt_labels, gt_bboxes_ignore = augment(img, gt_bboxes, gt_labels, gt_bboxes_ignore, self.img_scales[0], small_box_to_ignore=self.small_box_to_ignore)
+        #img, gt_bboxes, gt_labels, gt_bboxes_ignore = augment(img, gt_bboxes, gt_labels, gt_bboxes_ignore, self.img_scales[0], small_box_to_ignore=self.small_box_to_ignore)
+        oimg, ogt_bboxes, ogt_labels, ogt_bboxes_ignore = augment(img, gt_bboxes, gt_labels, gt_bboxes_ignore, self.img_scales[0], small_box_to_ignore=self.small_box_to_ignore)
+        while oimg.shape[0] != self.img_scales[0][1] or oimg.shape[1] != self.img_scales[0][0]:
+            oimg, ogt_bboxes, ogt_labels, ogt_bboxes_ignore = augment(img, gt_bboxes, gt_labels, gt_bboxes_ignore, self.img_scales[0], small_box_to_ignore=self.small_box_to_ignore)
+            print("Target size  not met, trying again!!!")
+        img, gt_bboxes, gt_labels, gt_bboxes_ignore =  oimg, ogt_bboxes, ogt_labels, ogt_bboxes_ignore
         ori_shape = img.shape[:2]
         img, img_shape, pad_shape, scale_factor = self.img_transform(
             img, img.shape[:2], False, keep_ratio=self.resize_keep_ratio)
@@ -402,7 +437,8 @@ def resize_image(image, gts, igs, scale=(0.4, 1.5)):
     ratio = np.random.uniform(scale[0], scale[1])
     # if len(gts)>0 and np.max(gts[:,3]-gts[:,1])>300:
     #     ratio = np.random.uniform(scale[0], 1.0)
-    new_height, new_width = int(ratio * height), int(ratio * width)
+    # new_height, new_width = int(ratio * height), int(ratio * width)
+    new_height, new_width = int(np.ceil(ratio * height)), int(np.ceil(ratio * width))
     image = cv2.resize(image, (new_width, new_height))
     if len(gts) > 0:
         gts = np.asarray(gts, dtype=float)
@@ -426,8 +462,8 @@ def random_crop(image, gts, gt_labels, igs, crop_size, limit=8, small_box_to_ign
         sel_center_x = int((gts[sel_id, 0] + gts[sel_id, 2]) / 2.0)
         sel_center_y = int((gts[sel_id, 1] + gts[sel_id, 3]) / 2.0)
     else:
-        sel_center_x = int(np.random.randint(0, img_width - crop_w + 1) + crop_w * 0.5)
-        sel_center_y = int(np.random.randint(0, img_height - crop_h + 1) + crop_h * 0.5)
+        sel_center_x = int(np.random.randint(0, max(1, img_width - crop_w + 1)) + crop_w * 0.5)
+        sel_center_y = int(np.random.randint(0, max(1, img_height - crop_h + 1)) + crop_h * 0.5)
 
     crop_x1 = max(sel_center_x - int(crop_w * 0.5), int(0))
     crop_y1 = max(sel_center_y - int(crop_h * 0.5), int(0))
@@ -475,9 +511,11 @@ def random_pave(image, gts, gt_labels, igs, pave_size, limit=8, small_box_to_ign
     pave_h, pave_w = pave_size
     # paved_image = np.zeros((pave_h, pave_w, 3), dtype=image.dtype)
     paved_image = np.ones((pave_h, pave_w, 3), dtype=image.dtype) * np.mean(image, dtype=int)
-    pave_x = int(np.random.randint(0, pave_w - img_width + 1))
-    pave_y = int(np.random.randint(0, pave_h - img_height + 1))
-    paved_image[pave_y:pave_y + img_height, pave_x:pave_x + img_width] = image
+    # pave_x = int(np.random.randint(0, pave_w - img_width + 1))
+    pave_x = int(np.random.randint(0, max(pave_w - img_width + 1, 1)))
+    pave_y = int(np.random.randint(0, max(pave_h - img_height + 1, 1)))
+    # paved_image[pave_y:pave_y + img_height, pave_x:pave_x + img_width] = image
+    paved_image[pave_y:pave_y + img_height, pave_x:min(pave_x + img_width, pave_w)] = image[:, :(min(pave_x + img_width, pave_w) - pave_x)]
     # pave detections
     add_ign = None
 

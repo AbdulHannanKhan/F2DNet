@@ -29,9 +29,14 @@ def single_gpu_test(model, data_loader, show=False, save_img=False, save_img_dir
     results = []
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
+    delta = 0
+    count = 0
     for i, data in enumerate(data_loader):
+        set = time.time()
         with torch.no_grad():
             result, id = model(return_loss=False, rescale=not show, return_id=True, **data)
+            delta += time.time() - set
+            count += 1
         results.append((result, id))
 
         if show:
@@ -41,6 +46,7 @@ def single_gpu_test(model, data_loader, show=False, save_img=False, save_img_dir
         batch_size = data['img'][0].size(0)
         for _ in range(batch_size):
             prog_bar.update()
+    print("\nImg/sec: ", int(count/delta * 1000)/1000)
     return results
 
 
@@ -134,6 +140,7 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--mean_teacher', action='store_true', help='test the mean teacher pth')
     parser.add_argument('--ecp', action='store_true', help='use ECP params')
+    parser.add_argument('--batch_size', type=int, default=1)
 
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
@@ -145,7 +152,7 @@ def main():
     args = parse_args()
 
     work_dir = "/".join(args.checkpoint.split("/")[:-1] + ['runs'])
-    Path(work_dir).mkdir(parents=True, exist_ok=True)
+    #Path(work_dir).mkdir(parents=True, exist_ok=True)
     
     cfg = mmcv.Config.fromfile(args.config)
 
@@ -154,8 +161,8 @@ def main():
 
     cfg.model.pretrained = None
     cfg.data.test.test_mode = True
-    tval_writer = SummaryWriter(work_dir + '/lamr_val')
-    ttrain_writer = SummaryWriter(work_dir + '/lamr_train')
+    #tval_writer = SummaryWriter(work_dir + '/lamr_val')
+    #ttrain_writer = SummaryWriter(work_dir + '/lamr_train')
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
@@ -172,8 +179,8 @@ def main():
     for i in range(args.checkpoint_start, args.checkpoint_end):
         data_loader = build_dataloader(
             dataset,
-            imgs_per_gpu=1,
-            workers_per_gpu=1,
+            imgs_per_gpu=args.batch_size,
+            workers_per_gpu=2,
             dist=distributed,
             shuffle=False)
 
@@ -206,6 +213,11 @@ def main():
         # for backward compatibility
 
         if not distributed:
+            print("Param count:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+            mem_params = sum([param.nelement() * param.element_size() for param in model.parameters()])
+            mem_bufs = sum([buf.nelement() * buf.element_size() for buf in model.buffers()])
+            mem = mem_params + mem_bufs
+            print("Mem Params: ", mem)
             model = MMDataParallel(model, device_ids=[0])
             outputs = single_gpu_test(model, data_loader, args.show, args.save_img, args.save_img_dir)
         else:
@@ -214,6 +226,7 @@ def main():
 
         if rank == 0:
             check = []
+            nu_wh_ratio = []
             for j in range(len(outputs)):
                 out, img_id = outputs[j]
                 if len(out) > 0:
@@ -229,19 +242,22 @@ def main():
                             temp['image_id'] = img_id
                             temp['category_id'] = 1
                             temp['bbox'] = box[:4].tolist()
+                            nu_wh_ratio.append(box[2]/box[3])
                             temp['score'] = float(box[4])
                             check.append(temp)
-            with open(args.out, 'w') as f:
+            nu_wh_ratio = np.array(nu_wh_ratio)
+            # print(f"Wh_ratio => nu: {nu_wh_ratio.mean()}, min: {nu_wh_ratio.min()}, max: {nu_wh_ratio.max()}")
+            with open(args.out, 'w') as f:  
                 json.dump(check, f)
             stats = validate(test_json, args.out, ecp=args.ecp)
             MRs = stats
             
             print("Checkpoint %d: [VR: %.2f], [VS: %.2f], [VH: %.2f], [VA: %.2f]" % (i, MRs[0], MRs[1], MRs[2], MRs[3]))
-            tval_writer.add_scalar('Reasonable', MRs[0], i)
-            tval_writer.add_scalar('Small', MRs[1], i)
-            tval_writer.add_scalar('Heavy', MRs[2], i)
-            tval_writer.add_scalar('All', MRs[3], i)
-            tval_writer.flush()
+            #tval_writer.add_scalar('Reasonable', MRs[0], i)
+            #tval_writer.add_scalar('Small', MRs[1], i)
+            #tval_writer.add_scalar('Heavy', MRs[2], i)
+            #tval_writer.add_scalar('All', MRs[3], i)
+            #tval_writer.flush()
             print("Checkpoint %d: " % i)
             print(stats)
 
